@@ -1,0 +1,10 @@
+access_token.txt
+*.wav
+*key*
+*test*
+instant*
+*.bak
+*.json
+*.mp3
+pd/*
+*.txt
