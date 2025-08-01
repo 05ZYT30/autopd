@@ -18,27 +18,54 @@ SYNTHESIS_OUTPUT_PATH = "streaming_output.wav"
 SYNTHESIS_PROGRESS_FILE = "synthesis_progress.txt"
 VOICE_CLONING_KEY_FILE = "voice_cloning_key.txt"
 
+# 正则表达式用于匹配自定义停顿标签
+PAUSE_TAG_PATTERN = re.compile(r'\[PAUSE:(\d+)ms\]')
+
 def split_text_by_punctuation(text: str) -> List[str]:
     """
-    根据英文标点符号分割文本，保留标点，作为自然停顿分段
+    根据英文标点符号和自定义停顿标签分割文本，保留标点和标签。
+    这个版本会更直接地匹配并分离出PAUSE标签和标点结尾的句子。
     """
-    # 这里用正则分割，分割点包括 . ? ! ，并保留标点
-    pattern = re.compile(r'([^.!?]+[.!?])', re.MULTILINE)
-    segments = pattern.findall(text)
-    segments = [seg.strip() for seg in segments if seg.strip()]
-    # 如果文本末尾无标点，则单独加入
-    last_index = sum(len(seg) for seg in segments)
-    if last_index < len(text):
-        tail = text[last_index:].strip()
-        if tail:
-            segments.append(tail)
-    return segments
+    # 匹配三种情况：
+    # 1. 以 .!? 结尾的句子 (group 1)
+    # 2. 自定义的 [PAUSE:Xms] 标签 (group 2)
+    # 3. 任何非空白字符序列，直到下一个匹配点 (group 3) - 用于捕获没有标点或PAUSE的末尾片段
+    # | 符号表示“或”
+    # (?P<segment>...) 是命名捕获组，方便后续处理
+    pattern = re.compile(r'(?P<sentence>[^.!?]+[.!?])|(?P<pause_tag>\[PAUSE:\d+ms\])|(?P<word_seq>[^\s\[.]*\S+)', re.MULTILINE)
+    
+    segments = []
+    last_end = 0
+    for match in pattern.finditer(text):
+        # 捕获匹配之前的任何文本（例如，如果开头没有标点或标签）
+        if match.start() > last_end:
+            leading_text = text[last_end:match.start()].strip()
+            if leading_text:
+                segments.append(leading_text)
+
+        # 添加匹配到的部分
+        matched_content = match.group(0).strip()
+        if matched_content:
+            segments.append(matched_content)
+        
+        last_end = match.end()
+
+    # 添加文本末尾剩余的部分（如果pattern没有覆盖）
+    if last_end < len(text):
+        trailing_text = text[last_end:].strip()
+        if trailing_text:
+            segments.append(trailing_text)
+            
+    # 过滤掉空字符串
+    return [s for s in segments if s]
+
 
 def generate_silence(duration_ms: int, sample_rate: int = 24000) -> bytes:
     """
     生成指定毫秒数的单声道16位PCM静音数据。
     """
     num_samples = int(sample_rate * duration_ms / 1000)
+    # 16-bit PCM (2 bytes per sample)
     silence = b'\x00\x00' * num_samples
     return silence
 
@@ -55,17 +82,21 @@ def get_next_available_path(base_path):
 
 def perform_voice_cloning_streaming_with_pauses(tts_client, voice_cloning_key: str, segments: List[str], output_path: str):
     voice_clone_params = texttospeech.VoiceCloneParams(voice_cloning_key=voice_cloning_key)
-    streaming_config = texttospeech.StreamingSynthesizeConfig(
-        voice=texttospeech.VoiceSelectionParams(
-            language_code="en-US",
-            voice_clone=voice_clone_params,
-        ),
-        streaming_audio_config=texttospeech.StreamingAudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.PCM,
-            sample_rate_hertz=24000,
-        ),
+    # 配置保持不变
+    streaming_config_request = texttospeech.StreamingSynthesizeRequest(
+        streaming_config=texttospeech.StreamingSynthesizeConfig(
+            voice=texttospeech.VoiceSelectionParams(
+                language_code="en-US",
+                voice_clone=voice_clone_params, # voice_clone_params 应该在外部定义或传入
+            ),
+            streaming_audio_config=texttospeech.StreamingAudioConfig(
+                audio_encoding=texttospeech.AudioEncoding.PCM,
+                sample_rate_hertz=24000,
+            ),
+        )
     )
-    config_request = texttospeech.StreamingSynthesizeRequest(streaming_config=streaming_config)
+    
+
 
     start_index = 0
     if os.path.exists(SYNTHESIS_PROGRESS_FILE):
@@ -73,51 +104,79 @@ def perform_voice_cloning_streaming_with_pauses(tts_client, voice_cloning_key: s
             with open(SYNTHESIS_PROGRESS_FILE, "r") as f:
                 start_index = int(f.read().strip()) + 1
         except Exception:
-            print("进度文件读取失败，重头开始合成")
+            print("进度文件读取失败，重头开始合成。")
 
-    segments_to_process = segments[start_index:]
-
+    # 尝试加载现有音频以实现断点续传
     existing_audio = io.BytesIO()
     if os.path.exists(output_path):
         try:
             with wave.open(output_path, 'rb') as w:
+                # 检查格式兼容性
                 if w.getnchannels() == 1 and w.getsampwidth() == 2 and w.getframerate() == 24000:
                     existing_audio.write(w.readframes(w.getnframes()))
+                    print(f"已加载现有音频文件: {output_path}")
                 else:
                     print("现有音频文件格式不兼容，将重写文件。")
-                    existing_audio = io.BytesIO()
+                    existing_audio = io.BytesIO() # 重置为空
         except Exception as e:
             print(f"读取现有音频文件异常，重写文件: {e}")
+            existing_audio = io.BytesIO() # 重置为空
+            
+    # 用于存储所有音频数据的列表
+    all_audio_content = [existing_audio.getvalue()]
 
-    segment_audio = [existing_audio.getvalue()]
+    current_segment_idx_for_progress = start_index # 真正用于进度跟踪的索引
 
-    def request_generator():
-        yield config_request
-        for i, segment_text in enumerate(segments_to_process):
-            print(f"合成段 {start_index + i}: {segment_text[:40]}...")
-            yield texttospeech.StreamingSynthesizeRequest(
-                input=texttospeech.StreamingSynthesisInput(text=segment_text)
-            )
+    for i in range(start_index, len(segments)):
+        segment_text = segments[i]
+        match = PAUSE_TAG_PATTERN.match(segment_text)
 
-    try:
-        responses = tts_client.streaming_synthesize(request_generator())
-        for i, res in enumerate(responses):
-            segment_audio.append(res.audio_content)
-            with open(SYNTHESIS_PROGRESS_FILE, "w") as f:
-                f.write(str(start_index + i))
-    except exceptions.GoogleAPICallError as e:
-        print(f"Google API 调用错误: {e}")
-        return
-    except Exception as e:
-        import traceback
-        print(f"未知错误发生: {e}")
-        traceback.print_exc()
-        return
+        if match:
+            # 这是一个自定义停顿标签
+            pause_duration_ms = int(match.group(1))
+            print(f"[{i+1}/{len(segments)}] 插入 {pause_duration_ms}ms 静音")
+            silent_data = generate_silence(pause_duration_ms, sample_rate=24000)
+            all_audio_content.append(silent_data)
+        else:
+            # 这是一个文本片段，需要进行 TTS 合成
+            print(f"[{i+1}/{len(segments)}] 合成文本: {segment_text[:50]}...")
+            
+            # 为当前文本片段创建一个新的请求生成器
+            def current_text_request_generator(text_to_synthesize):
+                yield streaming_config_request # 每次合成新片段时发送配置
+                yield texttospeech.StreamingSynthesizeRequest(
+                    input=texttospeech.StreamingSynthesisInput(text=text_to_synthesize)
+                )
 
-    # 合成所有音频，无额外插入静音（因为标点和语音本身会产生停顿）
+            try:
+                # 对当前文本片段执行流式合成
+                responses_for_segment = tts_client.streaming_synthesize(current_text_request_generator(segment_text))
+                
+                segment_audio_buffer = io.BytesIO()
+                for res in responses_for_segment:
+                    segment_audio_buffer.write(res.audio_content)
+                
+                all_audio_content.append(segment_audio_buffer.getvalue())
+                
+                # 成功合成后更新进度文件
+                with open(SYNTHESIS_PROGRESS_FILE, "w") as f:
+                    f.write(str(i)) # 记录当前完成的片段索引
+
+            except exceptions.GoogleAPICallError as e:
+                print(f"Google API 调用错误，无法合成片段 '{segment_text[:50]}...': {e}")
+                # 遇到错误时停止并保留进度
+                return
+            except Exception as e:
+                import traceback
+                print(f"未知错误发生，无法合成片段 '{segment_text[:50]}...': {e}")
+                traceback.print_exc()
+                # 遇到错误时停止并保留进度
+                return
+
+    print("所有片段处理完毕，合并音频...")
     combined_audio = io.BytesIO()
-    for seg in segment_audio:
-        combined_audio.write(seg)
+    for audio_data in all_audio_content:
+        combined_audio.write(audio_data)
 
     try:
         with wave.open(output_path, 'wb') as wav_file:
@@ -129,9 +188,10 @@ def perform_voice_cloning_streaming_with_pauses(tts_client, voice_cloning_key: s
         print(f"写入最终音频文件失败: {e}")
         return
 
+    # 所有合成完成后，删除进度文件
     if os.path.exists(SYNTHESIS_PROGRESS_FILE):
         os.remove(SYNTHESIS_PROGRESS_FILE)
-    print(f"最终音频写入: {output_path}")
+    print(f"最终音频成功写入: {output_path}")
 
 def load_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
@@ -141,23 +201,33 @@ def main():
     print("初始化 TTS 客户端...")
     tts_client = texttospeech.TextToSpeechClient()
 
-    print("读取文本并基于标点分段...")
+    print("读取文本并基于标点和自定义标签分段...")
     text = load_text(TEXT_TO_READ_FILE)
     segments = split_text_by_punctuation(text)
+    print(f"总共分段 {len(segments)} 个。")
 
+    voice_cloning_key = None
     if os.path.exists(VOICE_CLONING_KEY_FILE):
         with open(VOICE_CLONING_KEY_FILE, "r") as f:
             voice_cloning_key = f.read().strip()
+        print("已从文件加载 Voice Cloning Key。")
     else:
-        voice_cloning_key = create_instant_custom_voice_key(
-            project_id=PROJECT_ID,
-            reference_audio_path=REFERENCE_AUDIO_FILE,
-            consent_audio_path=CONSENT_AUDIO_FILE,
-        )
-        with open(VOICE_CLONING_KEY_FILE, "w") as f:
-            f.write(voice_cloning_key)
+        print("未找到 Voice Cloning Key，正在生成新的...")
+        try:
+            voice_cloning_key = create_instant_custom_voice_key(
+                project_id=PROJECT_ID,
+                reference_audio_path=REFERENCE_AUDIO_FILE,
+                consent_audio_path=CONSENT_AUDIO_FILE,
+            )
+            with open(VOICE_CLONING_KEY_FILE, "w") as f:
+                f.write(voice_cloning_key)
+            print("Voice Cloning Key 已生成并保存。")
+        except Exception as e:
+            print(f"生成 Voice Cloning Key 失败: {e}")
+            return
 
     output_path = get_next_available_path(SYNTHESIS_OUTPUT_PATH)
+    print(f"输出音频路径设置为: {output_path}")
 
     perform_voice_cloning_streaming_with_pauses(
         tts_client=tts_client,
@@ -216,4 +286,3 @@ def create_instant_custom_voice_key(project_id: str, reference_audio_path: str, 
 
 if __name__ == "__main__":
     main()
-
