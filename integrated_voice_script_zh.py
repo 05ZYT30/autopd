@@ -18,21 +18,23 @@ SYNTHESIS_OUTPUT_PATH = "streaming_output_zh.wav"
 SYNTHESIS_PROGRESS_FILE = "synthesis_progress_zh.txt"
 VOICE_CLONING_KEY_FILE = "voice_cloning_key_zh.txt"
 
-def split_text_by_punctuation(text: str) -> List[str]:
+def split_text_for_tts(text: str) -> List[str]:
     """
-    根据英文标点符号分割文本，保留标点，作为自然停顿分段
+    根据中文标点符号（包括句号、问号、感叹号、逗号、顿号、分号）进行切分，
+    保留标点并清除多余空格。
     """
-    # 这里用正则分割，分割点包括 . ? ! ，并保留标点
-    pattern = re.compile(r'([^.!?]+[.!?])', re.MULTILINE)
-    segments = pattern.findall(text)
-    segments = [seg.strip() for seg in segments if seg.strip()]
-    # 如果文本末尾无标点，则单独加入
-    last_index = sum(len(seg) for seg in segments)
-    if last_index < len(text):
-        tail = text[last_index:].strip()
-        if tail:
-            segments.append(tail)
-    return segments
+    # 使用断言保留标点作为结尾
+    pattern = re.compile(r'[^。！？；，、]*[。！？；，、]?')
+    segments = [seg.strip() for seg in pattern.findall(text) if seg.strip()]
+
+    # 合并过短的段落（小于8字的）与上一个段
+    merged = []
+    for seg in segments:
+        if merged and len(seg) < 8:
+            merged[-1] += seg
+        else:
+            merged.append(seg)
+    return merged
 
 def generate_silence(duration_ms: int, sample_rate: int = 24000) -> bytes:
     """
@@ -155,7 +157,7 @@ def main():
     print(f"加载文本成功，长度: {len(text)} 字符。")
 
     print("正在根据标点符号分段...")
-    segments = split_text_by_punctuation(text)
+    segments = split_text_for_tts(text)
     print(f"分段完成，共 {len(segments)} 段。")
     
     if os.path.exists(VOICE_CLONING_KEY_FILE):
